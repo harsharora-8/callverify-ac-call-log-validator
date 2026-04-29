@@ -1,0 +1,12 @@
+{
+  "name": "CallVerify: AC Call Log Validator",
+  "description": "Call log verification system for Academic Counselors featuring OCR data extraction and perceptual image hash duplicate detection.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "AI Data Extraction",
+    "Duplicate Detection",
+    "Supabase Storage"
+  ]
+}
