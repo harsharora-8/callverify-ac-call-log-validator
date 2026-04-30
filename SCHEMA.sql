@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS call_logs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+
 -- Index for hashing check
 CREATE INDEX IF NOT EXISTS idx_image_hash ON call_logs(image_hash);
 

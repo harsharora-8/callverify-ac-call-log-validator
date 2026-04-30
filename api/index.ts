@@ -1,23 +1,24 @@
 import express from "express";
 import { createClient } from "@supabase/supabase-js";
+import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Supabase Init
 const supabaseUrl = process.env.SUPABASE_URL || "";
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "";
 
 if (!supabaseUrl || !supabaseKey) {
-  console.error("CRITICAL: Supabase environment variables are missing! Please set SUPABASE_URL and SUPABASE_ANON_KEY in your secrets.");
+  console.error("CRITICAL: Supabase environment variables are missing!");
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
-// Hamming distance helper for hex segments
 function calculateHammingDistance(h1: string, h2: string): number {
   if (h1.length !== h2.length) return 999;
   let distance = 0;
@@ -25,7 +26,6 @@ function calculateHammingDistance(h1: string, h2: string): number {
     const v1 = parseInt(h1[i], 16);
     const v2 = parseInt(h2[i], 16);
     let xor = v1 ^ v2;
-    // Count set bits
     while (xor > 0) {
       if (xor & 1) distance++;
       xor >>= 1;
@@ -34,107 +34,164 @@ function calculateHammingDistance(h1: string, h2: string): number {
   return distance;
 }
 
-// API Routes
-app.post("/api/verify-log", async (req, res) => {
+function createExactKey(phone: string, time: string, duration: string): string {
+  const p = phone.replace(/[^0-9]/g, '').slice(-10);
+  const t = time.toLowerCase().trim();
+  const d = duration.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+  return `${p}_${t}_${d}`;
+}
+
+app.post("/api/verify-batch", async (req, res) => {
   try {
-    const { acEmail, phone, callTime, duration, imageHash, exactKey } = req.body;
-
-    if (!acEmail || !phone || !callTime || !duration || !imageHash || !exactKey) {
-      return res.status(400).json({ error: "Missing required fields" });
+    const { acEmail, logs } = req.body;
+    
+    if (!acEmail || !logs || !Array.isArray(logs) || logs.length === 0) {
+      return res.status(400).json({ error: "Missing email or logs array" });
     }
 
-    // 1. Exact Match Check (DB side)
-    const { data: exactMatch, error: exactError } = await supabase
-      .from("call_logs")
-      .select("*")
-      .eq("exact_key", exactKey)
-      .maybeSingle();
+    // 1. Pack images into Gemini payload maintaining order
+    const parts: any[] = [];
+    for (const log of logs) {
+      parts.push({
+        inlineData: { 
+          mimeType: "image/png", 
+          data: log.base64Image.split(',')[1] || log.base64Image 
+        }
+      });
+    }
+    
+    parts.push({
+      text: `Analyze these ${logs.length} call log screenshots in the exact order they are provided.
+      For each screenshot, extract:
+      1. Phone Number: Strict E.164 format (e.g., +919876543210).
+      2. Call Time: Exact time (e.g., 10:30 AM).
+      3. Duration: Total duration in seconds as string (e.g., "320").
+      Focus ONLY on the most recent or highlighted log in each image. 
+      Return an array of ${logs.length} objects corresponding exactly to the provided images.`
+    });
 
-    if (exactError) {
-      if (exactError.code === 'PGRST116' || exactError.message.includes('relation "call_logs" does not exist')) {
-        return res.status(500).json({ 
-          error: "Database Table Missing", 
-          message: "Please run the SQL in SCHEMA.sql in your Supabase SQL Editor to create the call_logs table." 
-        });
+    const response = await ai.models.generateContent({
+      model: "gemini-1.5-flash",
+      contents: { parts },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: { 
+              phone: { type: Type.STRING }, 
+              time: { type: Type.STRING }, 
+              duration: { type: Type.STRING } 
+            },
+            required: ["phone", "time", "duration"]
+          }
+        }
       }
-      throw exactError;
-    }
-    if (exactMatch) {
-      return res.json({ 
-        status: "REJECTED", 
-        reason: "DUPLICATE_ENTRY", 
-        message: "This exact call (Phone + Time + Duration) has already been logged." 
-      });
-    }
+    });
 
-    // 2. Fuzzy Match Check (Same phone + close time/duration)
-    const { data: fuzzyMatch, error: fuzzyError } = await supabase
-      .from("call_logs")
-      .select("*")
-      .eq("phone", phone)
-      .eq("duration", duration)
-      .limit(5);
-
-    if (fuzzyError) throw fuzzyError;
-    if (fuzzyMatch && fuzzyMatch.length > 0) {
-      return res.json({ 
-        status: "REJECTED", 
-        reason: "LIKELY_DUPLICATE", 
-        message: "A very similar call with this phone number already exists in our records." 
-      });
+    const text = response.text;
+    if (!text) {
+      throw new Error("Gemini returned empty response.");
+    }
+    
+    const extractedArray = JSON.parse(text);
+    if (!Array.isArray(extractedArray) || extractedArray.length !== logs.length) {
+      throw new Error(`Gemini returned ${extractedArray?.length} results, expected ${logs.length}`);
     }
 
-    // 3. Advanced Image Similarity Check (Hamming Distance)
+    // 2. Loop through and verify each against DB
+    const results = [];
+
     const { data: allLogs, error: hashError } = await supabase
       .from("call_logs")
       .select("image_hash")
       .order('created_at', { ascending: false })
-      .limit(200);
+      .limit(500);
 
-    if (hashError) throw hashError;
-    
-    const SIMILARITY_THRESHOLD = 10; 
-    
-    const similarLog = allLogs?.find(log => {
-      if (!log.image_hash) return false;
-      const dist = calculateHammingDistance(imageHash, log.image_hash);
-      return dist <= SIMILARITY_THRESHOLD;
-    });
+    for (let i = 0; i < logs.length; i++) {
+      const log = logs[i];
+      const extracted = extractedArray[i];
+      const exactKey = createExactKey(extracted.phone, extracted.time, extracted.duration);
+      
+      let status = "ACCEPTED";
+      let reason = null;
+      let message = "Call log verified and stored successfully!";
+      let logData = null;
 
-    if (similarLog) {
-      return res.json({ 
-        status: "REJECTED", 
-        reason: "IMAGE_REUSED", 
-        message: "This image (or a manipulated version) has been used recently. Please upload a fresh screenshot." 
+      try {
+        const { data: exactMatch } = await supabase
+          .from("call_logs")
+          .select("*")
+          .eq("exact_key", exactKey)
+          .maybeSingle();
+
+        if (exactMatch) {
+          status = "REJECTED";
+          reason = "DUPLICATE_ENTRY";
+          message = "This exact call (Phone + Time + Duration) has already been logged.";
+        } else {
+          const { data: fuzzyMatch } = await supabase
+            .from("call_logs")
+            .select("*")
+            .eq("phone", extracted.phone)
+            .eq("duration", extracted.duration)
+            .limit(5);
+
+          if (fuzzyMatch && fuzzyMatch.length > 0) {
+            status = "REJECTED";
+            reason = "LIKELY_DUPLICATE";
+            message = "A very similar call with this phone number already exists in our records.";
+          } else {
+            const SIMILARITY_THRESHOLD = 10; 
+            const similarLog = allLogs?.find(l => {
+              if (!l.image_hash) return false;
+              return calculateHammingDistance(log.imageHash, l.image_hash) <= SIMILARITY_THRESHOLD;
+            });
+            
+            if (similarLog) {
+              status = "REJECTED";
+              reason = "IMAGE_REUSED";
+              message = "This image (or a manipulated version) has been used recently.";
+            } else {
+              const { data: newLog, error: insertError } = await supabase
+                .from("call_logs")
+                .insert([{ 
+                  ac_email: acEmail, 
+                  phone: extracted.phone, 
+                  call_time: extracted.time, 
+                  duration: extracted.duration, 
+                  image_hash: log.imageHash, 
+                  exact_key: exactKey 
+                }])
+                .select()
+                .single();
+                
+              if (insertError) throw insertError;
+              logData = newLog;
+              allLogs?.unshift({ image_hash: log.imageHash });
+            }
+          }
+        }
+      } catch (err: any) {
+        status = "REJECTED";
+        message = "Database error: " + err.message;
+      }
+
+      results.push({
+        id: log.id,
+        status,
+        reason,
+        message,
+        extracted,
+        log: logData
       });
     }
 
-    // 4. Accept Entry
-    const { data: newLog, error: insertError } = await supabase
-      .from("call_logs")
-      .insert([
-        { 
-          ac_email: acEmail, 
-          phone, 
-          call_time: callTime, 
-          duration, 
-          image_hash: imageHash, 
-          exact_key: exactKey 
-        }
-      ])
-      .select()
-      .single();
-
-    if (insertError) throw insertError;
-
-    res.json({ 
-      status: "ACCEPTED", 
-      message: "Call log verified and stored successfully!",
-      log: newLog
-    });
+    res.json(results);
 
   } catch (error: any) {
-    console.error("Verification Error:", error);
+    console.error("Batch Verification Error:", error);
     res.status(500).json({ error: error.message || "Internal Server Error" });
   }
 });
@@ -145,25 +202,9 @@ app.get("/api/logs", async (req, res) => {
       .from("call_logs")
       .select("*")
       .order("created_at", { ascending: false });
-    
-    if (error) {
-      console.error("Supabase Error:", error);
-      const isMissingTable = 
-        error.code === 'PGRST116' || 
-        error.message.includes('relation "call_logs" does not exist') ||
-        error.message.includes('schema cache') ||
-        error.message.includes('not found');
-
-      const message = isMissingTable
-        ? "The 'call_logs' table was not found. Please run the SQL from SCHEMA.sql in your Supabase dashboard."
-        : error.message;
-      return res.status(500).json({ error: message, code: error.code });
-    }
-    
     res.json(data || []);
   } catch (err: any) {
-    console.error("Server Error in /api/logs:", err);
-    res.status(500).json({ error: err.message || "Internal Server Error" });
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -18,7 +18,11 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { generatePerceptualHash, createExactKey } from "@/src/lib/imageUtils";
-import { extractCallDataFromImage, ExtractedCallData } from "@/src/services/ocrService";
+export interface ExtractedCallData {
+  phone: string;
+  time: string;
+  duration: string;
+}
 
 interface CallLog {
   id: string;
@@ -124,91 +128,85 @@ export default function App() {
     setUploads(prev => prev.filter(u => u.id !== id));
   };
 
-  const processSingleUpload = async (uploadId: string) => {
-    const upload = uploads.find(u => u.id === uploadId);
-    if (!upload || upload.status === 'accepted') return;
-
-    setUploads(prev => prev.map(u => u.id === uploadId ? { ...u, status: 'processing' } : u));
-
-    try {
-      // 1. Hash
-      const hash = await generatePerceptualHash(upload.file);
-
-      // 2. OCR
-      const reader = new FileReader();
-      reader.readAsDataURL(upload.file);
-      const base64 = await new Promise<string>((resolve) => {
-        reader.onload = () => resolve(reader.result as string);
-      });
-
-      const data = await extractCallDataFromImage(base64);
-      if (!data) throw new Error("OCR Failed");
-
-      // 3. Exact Key
-      const exactKey = createExactKey(data.phone, data.time, data.duration);
-
-      // 4. Verify
-      const response = await fetch("/api/verify-log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          acEmail: email,
-          phone: data.phone,
-          callTime: data.time,
-          duration: data.duration,
-          imageHash: hash,
-          exactKey: exactKey
-        }),
-      });
-
-      const resData: VerificationResult = await response.json();
-      
-      setUploads(prev => prev.map(u => u.id === uploadId ? { 
-        ...u, 
-        status: resData.status === "ACCEPTED" ? 'accepted' : 'rejected',
-        result: resData,
-        extracted: data
-      } : u));
-
-      if (resData.status === "ACCEPTED") {
-        fetchLogs();
-        // Automatically remove from uploads after a short delay so it moves to logs
-        setTimeout(() => {
-          setUploads(prev => prev.filter(u => u.id !== uploadId));
-        }, 1500);
-      }
-    } catch (error: any) {
-      setUploads(prev => prev.map(u => u.id === uploadId ? { 
-        ...u, 
-        status: 'rejected',
-        result: { status: "REJECTED", message: error.message || "Failed to process image." }
-      } : u));
-    }
-  };
-
   const processAll = async () => {
     setIsProcessing(true);
     setBatchActionSummary(null);
-    // Use a copy of IDs because uploads state changes
-    const pendingIds = uploads.filter(u => u.status !== 'accepted' && u.status !== 'processing').map(u => u.id);
+    const pendingUploads = uploads.filter(u => u.status !== 'accepted' && u.status !== 'processing');
     
-    let acceptedCount = 0;
-    let rejectedCount = 0;
+    // Set to processing
+    setUploads(prev => prev.map(u => 
+      pendingUploads.some(p => p.id === u.id) ? { ...u, status: 'processing' } : u
+    ));
 
-    // Process sequentially to avoid API rate limits/concurrency issues
-    for (const id of pendingIds) {
-      await processSingleUpload(id);
-      // We can't easily count here because processSingleUpload handles state internally with timeouts
+    try {
+      const logsPayload = [];
+      for(const u of pendingUploads) {
+         const hash = await generatePerceptualHash(u.file);
+         const reader = new FileReader();
+         reader.readAsDataURL(u.file);
+         const base64 = await new Promise<string>((resolve) => {
+           reader.onload = () => resolve(reader.result as string);
+         });
+         logsPayload.push({
+            id: u.id,
+            base64Image: base64,
+            imageHash: hash
+         });
+      }
+
+      const response = await fetch("/api/verify-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // Increased max size might need handling at nginx/vercel level but works fine normally for < 4mb total
+        body: JSON.stringify({ acEmail: email, logs: logsPayload })
+      });
+
+      if (!response.ok) {
+        throw new Error("Batch verification failed. " + response.statusText);
+      }
+
+      const results = await response.json();
+      
+      let acceptedCount = 0;
+      setUploads(prev => prev.map(u => {
+        const matchingResult = results.find((r: any) => r.id === u.id);
+        if (matchingResult) {
+          if (matchingResult.status === "ACCEPTED") acceptedCount++;
+          return {
+            ...u,
+            status: matchingResult.status === "ACCEPTED" ? 'accepted' : 'rejected',
+            result: matchingResult,
+            extracted: matchingResult.extracted
+          };
+        }
+        return u;
+      }));
+
+      fetchLogs();
+      
+      // Auto-remove accepted
+      setTimeout(() => {
+        setUploads(prev => prev.filter(u => u.status !== 'accepted'));
+      }, 1500);
+
+      setBatchActionSummary({ 
+        accepted: acceptedCount, 
+        rejected: pendingUploads.length - acceptedCount 
+      });
+
+    } catch (err: any) {
+      console.error(err);
+      setUploads(prev => prev.map(u => 
+        pendingUploads.some(p => p.id === u.id) ? { 
+          ...u, 
+          status: 'rejected',
+          result: { status: "REJECTED", message: err.message || "Failed to process batch." }
+        } : u
+      ));
+    } finally {
+      setIsProcessing(false);
+      setTimeout(() => setBatchActionSummary(null), 5000);
     }
-    
-    setIsProcessing(false);
-    setBatchActionSummary({ 
-      accepted: pendingIds.length, // approximation for UI prompt
-      rejected: 0 
-    });
-
-    // Auto-hide summary after 5s
-    setTimeout(() => setBatchActionSummary(null), 5000);
   };
 
   if (!isLogged) {
